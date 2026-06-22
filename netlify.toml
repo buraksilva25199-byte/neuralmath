@@ -4,6 +4,15 @@
   functions = "netlify/functions"
   publish = "."
 
+# Сканер секретів Netlify блокує деплой, побачивши рядки схожі на API-ключі.
+# index.html і lesson.html містять Firebase apiKey — це ПУБЛІЧНИЙ ідентифікатор
+# за дизайном Firebase (захист реалізується через Security Rules і Authorized
+# Domains, а не приховування цього значення), тож виключаємо ці два файли зі
+# скану. GEMINI_API_KEY і FIREBASE_WEB_API_KEY залишаються лише в Environment
+# Variables і ніде в репозиторії не зустрічаються — сканер їх там і не шукає.
+[build.environment]
+  SECRETS_SCAN_OMIT_PATHS = "index.html,lesson.html"
+
 # Перенаправлення /api/tutor -> справжня функція,
 # щоб lesson.html не довелось переписувати (там виклик іде на /api/tutor)
 [[redirects]]
