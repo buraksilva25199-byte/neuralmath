@@ -1,0 +1,12 @@
+# netlify.toml — конфігурація деплою
+
+[build]
+  functions = "netlify/functions"
+  publish = "."
+
+# Перенаправлення /api/tutor -> справжня функція,
+# щоб lesson.html не довелось переписувати (там виклик іде на /api/tutor)
+[[redirects]]
+  from = "/api/tutor"
+  to = "/.netlify/functions/tutor"
+  status = 200
