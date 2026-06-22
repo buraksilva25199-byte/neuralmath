@@ -26,6 +26,7 @@ async function verifyFirebaseToken(idToken) {
 }
 
 // ── Netlify Functions (Lambda-сумісний формат) ──
+// event.headers, event.body — рядки; відповідь — { statusCode, headers, body }
 exports.handler = async function (event) {
 
   // ── CORS ──
@@ -165,11 +166,11 @@ exports.handler = async function (event) {
           body: JSON.stringify({
             system_instruction: { parts: [{ text: systemInstruction }] },
             contents: geminiContents,
-            generationConfig: { maxOutputTokens: 600, temperature: 0.7 },
+            generationConfig: { maxOutputTokens: 1500, temperature: 0.7 },
             safetySettings: [
               { category: 'HARM_CATEGORY_HARASSMENT',        threshold: 'BLOCK_ONLY_HIGH' },
               { category: 'HARM_CATEGORY_HATE_SPEECH',       threshold: 'BLOCK_ONLY_HIGH' },
-              { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_ONLY_HIGH' },
+            { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_ONLY_HIGH' },
               { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_ONLY_HIGH' }
             ]
           })
@@ -178,12 +179,13 @@ exports.handler = async function (event) {
 
       data = await upstream.json();
 
+      // Якщо модель не знайдена (404) або не підтримується — пробуємо наступну з списку
       const notFound = data.error && (upstream.status === 404 || /not found|not supported/i.test(data.error.message || ''));
       if (notFound && MODEL_CANDIDATES.indexOf(MODEL) < MODEL_CANDIDATES.length - 1) {
         console.warn(`Модель ${MODEL} недоступна, пробую наступну...`);
         continue;
       }
-      break;
+      break; // успіх або інша помилка — виходимо з циклу
     }
 
     console.log('Vector: використана модель —', usedModel);
