@@ -1170,10 +1170,18 @@ async function sendTutor(){
   typ.innerHTML='<span></span><span></span><span></span>';
   body.appendChild(typ); body.scrollTop=body.scrollHeight;
   try{
+    // Отримуємо Firebase ID-токен — сервер вимагає його для перевірки, хто пише
+    const token = (typeof window.getFirebaseToken === 'function')
+      ? await window.getFirebaseToken()
+      : null;
+
+    const headers = {'Content-Type':'application/json'};
+    if (token) headers['Authorization'] = 'Bearer ' + token;
+
     const res=await fetch('/api/tutor',{
       method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({messages:hist.slice(-10),sectionIdx:state.sec,sections:L.sections.map(s=>s.short)})
+      headers,
+      body:JSON.stringify({messages:hist.slice(-10),sectionIdx:state.sec,sections:L.sections.map(s=>s.short),lessonTitle:L.title})
     });
     const data=await res.json(); typ.remove();
     if(data.error){addMsg('bot','😣 '+data.error);send.disabled=false;return;}
@@ -1208,6 +1216,13 @@ async function sendTutor(){
 
   const app  = initializeApp(firebaseConfig);
   const auth = getAuth(app);
+
+  // Робимо токен доступним для звичайних (не-module) скриптів, як sendTutor()
+  window.getFirebaseToken = async () => {
+    const u = auth.currentUser;
+    if (!u) return null;
+    return await u.getIdToken(true); // true = примусово оновити, якщо застарів
+  };
 
   onAuthStateChanged(auth, (user) => {
     if (user) {
