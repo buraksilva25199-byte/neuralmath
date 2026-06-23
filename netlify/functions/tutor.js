@@ -121,7 +121,8 @@ exports.handler = async function (event) {
     `Вірно / Невірно\n` +
     `Відновлення правильної послідовності кроків.\n` +
     `Розбір похожих помилок\n` +
-    `Чекай на відповідь учня, перш ніж переходити до наступного кроку.\n\n` +
+    `Чекай на відповідь учня, перш ніж переходити до наступного кроку.\n` +
+    `ФОРМАТ ВАРІАНТІВ (обов'язково): кожен варіант з НОВОГО рядка у вигляді "А) текст", "Б) текст", "В) текст", "Г) текст". Для так/ні пиши слова "Вірно" і "Невірно". Інтерфейс перетворить їх на кнопки, тож не проси учня "написати літеру".\n\n` +
     `КРОК 4. Перевірка засвоєння (після успішного розв'язання):\n` +
     `Коли учень за твоєю допомогою правильно розв'язав своє завдання, згенеруй 2-4 аналогічні, але короткі завдання на перевірку закріплення цього конкретного навику але в системному вигляді.\n\n` +
     `Тон: Професійний, підтримуючий, академічний, але зрозумілий. Форматування математики виключно в LaTeX (inline у $...$, вирази у $$...$$).\n` +
@@ -154,50 +155,80 @@ exports.handler = async function (event) {
     ? [process.env.GEMINI_MODEL]
     : ['gemini-3.5-flash', 'gemini-2.5-flash', 'gemini-1.5-flash'];
 
+  // Netlify обриває функцію примусово після 30с — тримаємо запас.
+  // Кожен запит до Gemini обмежений 9с, всього не більше 3 спроб підряд
+  // (3×9с + паузи ≈ 28с максимум), щоб точно встигнути відповісти вчасно.
+  const PER_REQUEST_TIMEOUT_MS = 9000;
+  const MAX_TOTAL_ATTEMPTS = 3;
+  let totalAttempts = 0;
+
+  async function callGemini(MODEL) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), PER_REQUEST_TIMEOUT_MS);
+    try {
+      const upstream = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': geminiKey
+          },
+          signal: controller.signal,
+          body: JSON.stringify({
+            system_instruction: { parts: [{ text: systemInstruction }] },
+            contents: geminiContents,
+            generationConfig: { maxOutputTokens: 1500, temperature: 0.7 },
+            safetySettings: [
+              { category: 'HARM_CATEGORY_HARASSMENT',        threshold: 'BLOCK_ONLY_HIGH' },
+              { category: 'HARM_CATEGORY_HATE_SPEECH',       threshold: 'BLOCK_ONLY_HIGH' },
+              { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_ONLY_HIGH' },
+              { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_ONLY_HIGH' }
+            ]
+          })
+        }
+      );
+      const data = await upstream.json();
+      return { upstream, data };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   try {
     let upstream, data, usedModel;
 
+    outer:
     for (const MODEL of MODEL_CANDIDATES) {
       usedModel = MODEL;
 
-      // До 2 спроб на одну модель — Gemini іноді тимчасово перевантажений (503)
+      // До 2 спроб на одну модель — Gemini іноді тимчасово перевантажений (503).
+      // Але загальна кількість спроб по всіх моделях обмежена MAX_TOTAL_ATTEMPTS.
       for (let attempt = 1; attempt <= 2; attempt++) {
-        upstream = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-goog-api-key': geminiKey
-            },
-            body: JSON.stringify({
-              system_instruction: { parts: [{ text: systemInstruction }] },
-              contents: geminiContents,
-              generationConfig: { maxOutputTokens: 1500, temperature: 0.7 },
-              safetySettings: [
-                { category: 'HARM_CATEGORY_HARASSMENT',        threshold: 'BLOCK_ONLY_HIGH' },
-                { category: 'HARM_CATEGORY_HATE_SPEECH',       threshold: 'BLOCK_ONLY_HIGH' },
-                { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_ONLY_HIGH' },
-                { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_ONLY_HIGH' }
-              ]
-            })
-          }
-        );
+        if (totalAttempts >= MAX_TOTAL_ATTEMPTS) break outer;
+        totalAttempts++;
 
-        data = await upstream.json();
+        try {
+          ({ upstream, data } = await callGemini(MODEL));
+        } catch (e) {
+          // AbortError (таймаут конкретного запиту) — рахуємо як перевантаження
+          console.warn(`Запит до ${MODEL} перевищив ${PER_REQUEST_TIMEOUT_MS}мс, ${e.name}`);
+          data = { error: { message: 'request timeout (overloaded)' } };
+          upstream = { status: 503 };
+        }
 
         const overloaded = upstream.status === 503 || /overloaded|high demand|unavailable/i.test(data.error?.message || '');
-        if (overloaded && attempt < 2) {
+        if (overloaded && attempt < 2 && totalAttempts < MAX_TOTAL_ATTEMPTS) {
           console.warn(`Модель ${MODEL} перевантажена, повторюю спробу...`);
-          await new Promise(r => setTimeout(r, 800)); // коротка пауза перед повтором
+          await new Promise(r => setTimeout(r, 400)); // коротка пауза перед повтором
           continue;
         }
-        break; // успіх, або вже друга спроба — виходимо з внутрішнього циклу
+        break; // успіх, або вже остання спроба — виходимо з внутрішнього циклу
       }
 
       // Якщо модель не знайдена (404) або не підтримується — пробуємо наступну з списку
       const notFound = data.error && (upstream.status === 404 || /not found|not supported/i.test(data.error.message || ''));
-      if (notFound && MODEL_CANDIDATES.indexOf(MODEL) < MODEL_CANDIDATES.length - 1) {
+      if (notFound && MODEL_CANDIDATES.indexOf(MODEL) < MODEL_CANDIDATES.length - 1 && totalAttempts < MAX_TOTAL_ATTEMPTS) {
         console.warn(`Модель ${MODEL} недоступна, пробую наступну...`);
         continue;
       }
