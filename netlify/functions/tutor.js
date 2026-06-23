@@ -106,7 +106,10 @@ exports.handler = async function (event) {
 
   const systemInstruction =
     `Роль: Ти — експертний, терплячий ШІ-репетитор з математики. Твоя мета — навчити учня мислити, а не просто давати правильні відповіді.\n\n` +
-    `Твій алгоритм дій, коли учень робить помилку:\n\n` +
+    `ВАЖЛИВО — спочатку визнач тип запиту:\n` +
+    `Якщо учень просто запитує означення, простий факт або "що таке X" (без помилки у власному розв'язку) — дай ПРЯМУ коротку відповідь (2-4 речення), без чотирикрокового алгоритму нижче. Не вигадуй штучну "помилку", якщо учень її не зробив.\n` +
+    `Чотирикроковий алгоритм застосовуй ТІЛЬКИ тоді, коли учень дійсно припустився помилки у власній відповіді на конкретне завдання, або сам просить розібрати завдання крок за кроком.\n\n` +
+    `Твій алгоритм дій, коли учень РОБИТЬ ПОМИЛКУ у завданні:\n\n` +
     `КРОК 1. Внутрішня діагностика (невидима для учня):\n` +
     `- Зрозумій ГЛОБАЛЬНУ ТЕМУ (зараз це «${title}», розділ «${curSec}»).\n` +
     `Проаналізуй помилку. Визнач її корінь: це нерозуміння поточної теми (наприклад, властивості степенів) чи прогалина в базових/попередніх темах (наприклад, невміння додавати від'ємні числа чи працювати з дробами)?\n\n` +
@@ -126,6 +129,7 @@ exports.handler = async function (event) {
     `Контекст уроку «${title}»:\n${secList}\n` +
     `Ключові факти теми: ${keyFacts}\n` +
     `Відповідай українською мовою.`;
+
 
   // ── Крок 6: санітизація + конвертація історії у формат Gemini ──
   const safeHistory = messages
@@ -155,29 +159,41 @@ exports.handler = async function (event) {
 
     for (const MODEL of MODEL_CANDIDATES) {
       usedModel = MODEL;
-      upstream = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-goog-api-key': geminiKey
-          },
-          body: JSON.stringify({
-            system_instruction: { parts: [{ text: systemInstruction }] },
-            contents: geminiContents,
-            generationConfig: { maxOutputTokens: 1500, temperature: 0.7 },
-            safetySettings: [
-              { category: 'HARM_CATEGORY_HARASSMENT',        threshold: 'BLOCK_ONLY_HIGH' },
-              { category: 'HARM_CATEGORY_HATE_SPEECH',       threshold: 'BLOCK_ONLY_HIGH' },
-            { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_ONLY_HIGH' },
-              { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_ONLY_HIGH' }
-            ]
-          })
-        }
-      );
 
-      data = await upstream.json();
+      // До 2 спроб на одну модель — Gemini іноді тимчасово перевантажений (503)
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        upstream = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-goog-api-key': geminiKey
+            },
+            body: JSON.stringify({
+              system_instruction: { parts: [{ text: systemInstruction }] },
+              contents: geminiContents,
+              generationConfig: { maxOutputTokens: 1500, temperature: 0.7 },
+              safetySettings: [
+                { category: 'HARM_CATEGORY_HARASSMENT',        threshold: 'BLOCK_ONLY_HIGH' },
+                { category: 'HARM_CATEGORY_HATE_SPEECH',       threshold: 'BLOCK_ONLY_HIGH' },
+                { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_ONLY_HIGH' },
+                { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_ONLY_HIGH' }
+              ]
+            })
+          }
+        );
+
+        data = await upstream.json();
+
+        const overloaded = upstream.status === 503 || /overloaded|high demand|unavailable/i.test(data.error?.message || '');
+        if (overloaded && attempt < 2) {
+          console.warn(`Модель ${MODEL} перевантажена, повторюю спробу...`);
+          await new Promise(r => setTimeout(r, 800)); // коротка пауза перед повтором
+          continue;
+        }
+        break; // успіх, або вже друга спроба — виходимо з внутрішнього циклу
+      }
 
       // Якщо модель не знайдена (404) або не підтримується — пробуємо наступну з списку
       const notFound = data.error && (upstream.status === 404 || /not found|not supported/i.test(data.error.message || ''));
@@ -185,25 +201,41 @@ exports.handler = async function (event) {
         console.warn(`Модель ${MODEL} недоступна, пробую наступну...`);
         continue;
       }
-      break; // успіх або інша помилка — виходимо з циклу
+      break; // успіх або інша помилка — виходимо з зовнішнього циклу
     }
 
     console.log('Vector: використана модель —', usedModel);
 
     if (data.error) {
       console.error('Gemini error:', data.error);
+      const overloaded = upstream.status === 503 || /overloaded|high demand|unavailable/i.test(data.error.message || '');
+      if (overloaded) {
+        return respond(503, { error: 'Vector зараз перевантажений запитами. Спробуй ще раз за хвилину 🙏' });
+      }
       return respond(502, { error: data.error.message || 'Помилка Gemini API.' });
     }
 
     const candidate = data.candidates?.[0];
-    if (!candidate || candidate.finishReason === 'SAFETY') {
+    if (!candidate) {
+      console.error('Gemini: no candidate returned', JSON.stringify(data));
+      return respond(502, { error: 'Vector не зміг сформулювати відповідь. Спробуй перефразувати питання.' });
+    }
+    if (candidate.finishReason === 'SAFETY') {
       return respond(200, { text: 'Перефразуй питання, будь ласка 🙂' });
+    }
+    if (candidate.finishReason === 'MAX_TOKENS') {
+      console.warn('Gemini: відповідь обірвана через ліміт токенів');
     }
 
     const text = (candidate.content?.parts || [])
       .map(p => p.text || '')
       .join('\n')
-      .trim() || 'Спробуй ще раз сформулювати 🙂';
+      .trim();
+
+    if (!text) {
+      console.error('Gemini: empty text in candidate', JSON.stringify(candidate));
+      return respond(502, { error: 'Vector не зміг сформулювати відповідь. Спробуй перефразувати питання.' });
+    }
 
     return respond(200, { text });
 
